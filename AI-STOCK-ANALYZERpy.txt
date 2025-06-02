@@ -1,0 +1,711 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+from scipy import stats
+from scipy.optimize import minimize
+from scipy.signal import find_peaks, argrelextrema
+import warnings
+import concurrent.futures
+import functools
+import time
+from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass, field
+from enum import Enum
+import json
+import logging
+import sqlite3
+import os
+from pathlib import Path
+import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import requests
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import ta
+
+warnings.filterwarnings('ignore')
+
+# Configure logging for better debugging and monitoring
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ===================================
+# CONFIGURATION AND DATA CLASSES
+# ===================================
+
+@dataclass
+class MarketConfig:
+    """Configuration class for market parameters and thresholds"""
+    RISK_FREE_RATE: float = 0.045  # 10-year Treasury rate
+    TRADING_DAYS_YEAR: int = 252
+    RSI_OVERBOUGHT: int = 70
+    RSI_OVERSOLD: int = 30
+    BOLLINGER_PERIODS: int = 20
+    BOLLINGER_STD: float = 2.0
+    MACD_FAST: int = 12
+    MACD_SLOW: int = 26
+    MACD_SIGNAL: int = 9
+    ATR_PERIOD: int = 14
+    VOLUME_MA_PERIOD: int = 20
+    
+    # Risk thresholds
+    HIGH_VOLATILITY_THRESHOLD: float = 50.0
+    EXTREME_VOLATILITY_THRESHOLD: float = 75.0
+    HIGH_BETA_THRESHOLD: float = 1.5
+    EXTREME_BETA_THRESHOLD: float = 2.0
+    
+    # Pattern detection parameters
+    PATTERN_LOOKBACK: int = 50
+    MIN_PATTERN_CONFIDENCE: float = 0.6
+    
+    # Signal generation parameters
+    SIGNAL_WEIGHT_TECHNICAL: float = 0.4
+    SIGNAL_WEIGHT_FUNDAMENTAL: float = 0.3
+    SIGNAL_WEIGHT_SENTIMENT: float = 0.3
+
+class SignalStrength(Enum):
+    """Enumeration for signal strength classifications"""
+    STRONG_SELL = -3
+    SELL = -2
+    WEAK_SELL = -1
+    NEUTRAL = 0
+    WEAK_BUY = 1
+    BUY = 2
+    STRONG_BUY = 3
+
+class RiskLevel(Enum):
+    """Risk level classifications"""
+    VERY_LOW = 1
+    LOW = 2
+    MODERATE = 3
+    HIGH = 4
+    VERY_HIGH = 5
+
+@dataclass
+class TradingSignal:
+    """Data class for structured trading signals"""
+    signal_type: SignalStrength
+    confidence: float
+    reasoning: str
+    supporting_indicators: List[str]
+    risk_factors: List[str]
+    price_targets: Dict[str, float]
+    stop_loss: float
+    risk_reward_ratio: float
+    holding_period: str
+    timestamp: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class RiskMetrics:
+    """Comprehensive risk metrics data class"""
+    beta: float
+    alpha: float
+    sharpe_ratio: float
+    sortino_ratio: float
+    max_drawdown: float
+    var_95: float
+    var_99: float
+    volatility: float
+    downside_deviation: float
+    risk_level: RiskLevel
+
+@dataclass
+class FundamentalData:
+    """Fundamental analysis data structure"""
+    pe_ratio: float
+    peg_ratio: float
+    price_to_book: float
+    debt_to_equity: float
+    roe: float
+    roa: float
+    current_ratio: float
+    quick_ratio: float
+    gross_margin: float
+    operating_margin: float
+    net_margin: float
+    revenue_growth: float
+    earnings_growth: float
+    fundamental_score: float
+
+# ===================================
+# PERFORMANCE OPTIMIZATION UTILITIES
+# ===================================
+
+def timer(func):
+    """Decorator to measure function execution time"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        logger.info(f"{func.__name__} executed in {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
+
+def memoize(func):
+    """Simple memoization decorator for caching expensive calculations"""
+    cache = {}
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        key = str(args) + str(sorted(kwargs.items()))
+        if key not in cache:
+            cache[key] = func(*args, **kwargs)
+        return cache[key]
+    return wrapper
+
+class DataManager:
+    """Enhanced data management with caching and database integration"""
+    
+    def __init__(self, cache_dir: str = "cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.db_path = self.cache_dir / "stock_data.db"
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database for caching"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stock_data (
+                ticker TEXT,
+                date TEXT,
+                data BLOB,
+                timestamp REAL,
+                PRIMARY KEY (ticker, date)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_results (
+                ticker TEXT,
+                analysis_type TEXT,
+                data BLOB,
+                timestamp REAL,
+                PRIMARY KEY (ticker, analysis_type)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def cache_data(self, ticker: str, data: pd.DataFrame, data_type: str = "price"):
+        """Cache data to database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            data_blob = pickle.dumps(data)
+            timestamp = time.time()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO stock_data (ticker, date, data, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (ticker, data_type, data_blob, timestamp))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"Cached {data_type} data for {ticker}")
+        except Exception as e:
+            logger.error(f"Error caching data: {e}")
+    
+    def load_cached_data(self, ticker: str, data_type: str = "price", max_age_hours: int = 24) -> Optional[pd.DataFrame]:
+        """Load cached data if available and not expired"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT data, timestamp FROM stock_data 
+                WHERE ticker = ? AND date = ?
+            ''', (ticker, data_type))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                data_blob, timestamp = result
+                age_hours = (time.time() - timestamp) / 3600
+                
+                if age_hours < max_age_hours:
+                    data = pickle.loads(data_blob)
+                    logger.info(f"Loaded cached {data_type} data for {ticker} (age: {age_hours:.1f}h)")
+                    return data
+                else:
+                    logger.info(f"Cached data for {ticker} expired ({age_hours:.1f}h old)")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error loading cached data: {e}")
+            return None
+
+class DataValidator:
+    """Enhanced data validation and cleaning utilities"""
+    
+    @staticmethod
+    def validate_ticker(ticker: str) -> bool:
+        """
+        Validate ticker symbol format and availability
+        
+        Args:
+            ticker: Stock ticker symbol
+            
+        Returns:
+            bool: True if ticker is valid, False otherwise
+        """
+        if not ticker or len(ticker.strip()) == 0:
+            return False
+        
+        # Basic format validation
+        ticker = ticker.strip().upper()
+        if not ticker.replace('.', '').replace('-', '').isalpha() or len(ticker) > 10:
+            return False
+        
+        try:
+            # Quick validation by attempting to fetch basic info
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            return 'symbol' in info or 'shortName' in info
+        except:
+            return False
+    
+    @staticmethod
+    def clean_financial_data(data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean and validate financial data
+        
+        This function performs several critical data cleaning operations:
+        1. Removes rows with all NaN values
+        2. Forward fills missing OHLC data (common in market holidays)
+        3. Removes negative prices (data errors)
+        4. Caps extreme outliers (likely data errors)
+        5. Ensures volume is non-negative
+        
+        Args:
+            data: Raw OHLC data from yfinance
+            
+        Returns:
+            pd.DataFrame: Cleaned data
+        """
+        if data.empty:
+            return data
+        
+        # Remove completely empty rows
+        data = data.dropna(how='all')
+        
+        # Forward fill missing OHLC data (common for holidays)
+        price_columns = ['Open', 'High', 'Low', 'Close']
+        for col in price_columns:
+            if col in data.columns:
+                data[col] = data[col].fillna(method='ffill')
+        
+        # Remove negative prices (data errors)
+        for col in price_columns:
+            if col in data.columns:
+                data = data[data[col] > 0]
+        
+        # Cap extreme outliers (> 10x daily average is likely an error)
+        for col in price_columns:
+            if col in data.columns:
+                rolling_mean = data[col].rolling(30).mean()
+                outlier_threshold = rolling_mean * 10
+                data[col] = np.where(data[col] > outlier_threshold, rolling_mean, data[col])
+        
+        # Ensure volume is non-negative
+        if 'Volume' in data.columns:
+            data['Volume'] = data['Volume'].fillna(0).clip(lower=0)
+        
+        return data
+    
+    @staticmethod
+    def validate_data_sufficiency(data: pd.DataFrame, min_periods: int = 30) -> Tuple[bool, str]:
+        """
+        Validate if data is sufficient for analysis
+        
+        Args:
+            data: Stock price data
+            min_periods: Minimum required periods
+            
+        Returns:
+            Tuple[bool, str]: (is_valid, explanation)
+        """
+        if data.empty:
+            return False, "No data available"
+        
+        if len(data) < min_periods:
+            return False, f"Insufficient data: {len(data)} periods (minimum {min_periods} required)"
+        
+        # Check for too many missing values
+        missing_ratio = data.isnull().sum().sum() / (len(data) * len(data.columns))
+        if missing_ratio > 0.2:
+            return False, f"Too many missing values: {missing_ratio:.1%}"
+        
+        return True, "Data is sufficient for analysis"
+
+# ===================================
+# ADVANCED TECHNICAL INDICATORS
+# ===================================
+
+class TechnicalIndicators:
+    """
+    Enhanced technical indicators with detailed explanations and optimized calculations
+    
+    This class implements professional-grade technical indicators used by institutional
+    traders and quantitative analysts. Each indicator includes detailed explanations
+    of its purpose, interpretation, and trading applications.
+    """
+    
+    def __init__(self, config: MarketConfig = MarketConfig()):
+        self.config = config
+    
+    @timer
+    def calculate_all_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate all technical indicators in optimized batch processing
+        
+        This method uses vectorized operations wherever possible to maximize performance.
+        Indicators are calculated in dependency order to avoid recalculation.
+        
+        Args:
+            data: OHLCV data
+            
+        Returns:
+            pd.DataFrame: Data with all technical indicators
+        """
+        logger.info("Calculating comprehensive technical indicators...")
+        
+        # Ensure we have clean data
+        data = DataValidator.clean_financial_data(data)
+        
+        # Basic price calculations (vectorized)
+        data['HL2'] = (data['High'] + data['Low']) / 2
+        data['HLC3'] = (data['High'] + data['Low'] + data['Close']) / 3
+        data['OHLC4'] = (data['Open'] + data['High'] + data['Low'] + data['Close']) / 4
+        
+        # Moving averages (using exponential weight for efficiency)
+        data = self._calculate_moving_averages(data)
+        
+        # Momentum indicators
+        data = self._calculate_momentum_indicators(data)
+        
+        # Volatility indicators
+        data = self._calculate_volatility_indicators(data)
+        
+        # Volume indicators
+        data = self._calculate_volume_indicators(data)
+        
+        # Advanced oscillators
+        data = self._calculate_advanced_oscillators(data)
+        
+        # Trend indicators
+        data = self._calculate_trend_indicators(data)
+        
+        logger.info("Technical indicators calculation completed")
+        return data
+    
+    def _calculate_moving_averages(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate various moving averages with detailed explanations
+        
+        Moving averages are fundamental trend-following indicators that smooth price action
+        to identify the underlying trend direction. Different types serve different purposes:
+        
+        - SMA (Simple): Equal weight to all periods, good for long-term trends
+        - EMA (Exponential): More weight to recent prices, faster response to changes
+        - Hull MA: Eliminates lag while maintaining smoothness
+        """
+        # Simple Moving Averages
+        for period in [5, 10, 20, 50, 100, 200]:
+            if len(data) >= period:
+                data[f'SMA_{period}'] = data['Close'].rolling(period).mean()
+        
+        # Exponential Moving Averages (more responsive to recent prices)
+        for period in [12, 26, 50]:
+            if len(data) >= period:
+                data[f'EMA_{period}'] = data['Close'].ewm(span=period).mean()
+        
+        # Hull Moving Average (reduced lag)
+        if len(data) >= 20:
+            half_length = 10
+            sqrt_length = int(np.sqrt(20))
+            wma1 = data['Close'].rolling(half_length).apply(lambda x: np.average(x, weights=np.arange(1, len(x)+1)))
+            wma2 = data['Close'].rolling(20).apply(lambda x: np.average(x, weights=np.arange(1, len(x)+1)))
+            hull_raw = 2 * wma1 - wma2
+            data['Hull_MA'] = hull_raw.rolling(sqrt_length).apply(lambda x: np.average(x, weights=np.arange(1, len(x)+1)))
+        
+        # Volume Weighted Average Price (VWAP)
+        if 'Volume' in data.columns and len(data) >= 20:
+            data['VWAP'] = (data['Close'] * data['Volume']).cumsum() / data['Volume'].cumsum()
+        
+        return data
+    
+    def _calculate_momentum_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate momentum indicators with comprehensive explanations
+        
+        Momentum indicators measure the rate of change in price movements:
+        
+        RSI (Relative Strength Index):
+        - Ranges 0-100, measures speed and magnitude of price changes
+        - >70: Potentially overbought (sell signal)
+        - <30: Potentially oversold (buy signal)
+        - Divergences with price can signal trend reversals
+        
+        Stochastic Oscillator:
+        - Compares closing price to price range over period
+        - %K: Fast line, %D: Slow line (3-period SMA of %K)
+        - >80: Overbought, <20: Oversold
+        """
+        # RSI Calculation (optimized)
+        if len(data) >= 14:
+            delta = data['Close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            data['RSI'] = 100 - (100 / (1 + rs))
+            
+            # RSI interpretation levels
+            data['RSI_Overbought'] = data['RSI'] > self.config.RSI_OVERBOUGHT
+            data['RSI_Oversold'] = data['RSI'] < self.config.RSI_OVERSOLD
+        
+        # Stochastic Oscillator
+        if len(data) >= 14:
+            high_14 = data['High'].rolling(14).max()
+            low_14 = data['Low'].rolling(14).min()
+            data['Stoch_K'] = 100 * (data['Close'] - low_14) / (high_14 - low_14)
+            data['Stoch_D'] = data['Stoch_K'].rolling(3).mean()
+        
+        # Williams %R (opposite scale to Stochastic)
+        if len(data) >= 14:
+            data['Williams_R'] = -100 * (high_14 - data['Close']) / (high_14 - low_14)
+        
+        # Rate of Change (ROC)
+        for period in [10, 20]:
+            if len(data) > period:
+                data[f'ROC_{period}'] = ((data['Close'] - data['Close'].shift(period)) / data['Close'].shift(period)) * 100
+        
+        # Momentum
+        if len(data) >= 10:
+            data['Momentum_10'] = data['Close'] / data['Close'].shift(10) * 100
+        
+        return data
+    
+    def _calculate_volatility_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate volatility indicators with trading insights
+        
+        Bollinger Bands:
+        - Price envelope based on standard deviation
+        - Middle: 20-day SMA, Upper/Lower: ±2 standard deviations
+        - Price touching bands suggests potential reversal
+        - Band squeeze (narrow bands) often precedes volatility expansion
+        
+        Average True Range (ATR):
+        - Measures volatility, not direction
+        - Used for position sizing and stop-loss placement
+        - Higher ATR = higher volatility = wider stops needed
+        """
+        # Bollinger Bands
+        if len(data) >= self.config.BOLLINGER_PERIODS:
+            bb_middle = data['Close'].rolling(self.config.BOLLINGER_PERIODS).mean()
+            bb_std = data['Close'].rolling(self.config.BOLLINGER_PERIODS).std()
+            
+            data['BB_Middle'] = bb_middle
+            data['BB_Upper'] = bb_middle + (bb_std * self.config.BOLLINGER_STD)
+            data['BB_Lower'] = bb_middle - (bb_std * self.config.BOLLINGER_STD)
+            
+            # Bollinger Band position (0 = lower band, 1 = upper band)
+            data['BB_Position'] = (data['Close'] - data['BB_Lower']) / (data['BB_Upper'] - data['BB_Lower'])
+            
+            # Band width (measure of volatility)
+            data['BB_Width'] = (data['BB_Upper'] - data['BB_Lower']) / data['BB_Middle']
+        
+        # Average True Range (ATR)
+        if len(data) >= self.config.ATR_PERIOD:
+            high_low = data['High'] - data['Low']
+            high_close = np.abs(data['High'] - data['Close'].shift())
+            low_close = np.abs(data['Low'] - data['Close'].shift())
+            
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            data['ATR'] = true_range.rolling(self.config.ATR_PERIOD).mean()
+            
+            # ATR-based stop loss levels
+            atr_multiplier = 2.0
+            data['ATR_Stop_Long'] = data['Close'] - (data['ATR'] * atr_multiplier)
+            data['ATR_Stop_Short'] = data['Close'] + (data['ATR'] * atr_multiplier)
+        
+        # Historical Volatility (annualized)
+        data['Hist_Vol'] = data['Close'].pct_change().rolling(30).std() * np.sqrt(self.config.TRADING_DAYS_YEAR) * 100
+        
+        # Keltner Channels
+        if len(data) >= 20 and 'ATR' in data.columns:
+            ema_20 = data['Close'].ewm(span=20).mean()
+            data['Keltner_Middle'] = ema_20
+            data['Keltner_Upper'] = ema_20 + (data['ATR'] * 2)
+            data['Keltner_Lower'] = ema_20 - (data['ATR'] * 2)
+        
+        return data
+    
+    def _calculate_volume_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate volume-based indicators with market interpretation
+        
+        Volume analysis is crucial for confirming price movements:
+        
+        On-Balance Volume (OBV):
+        - Running total of volume based on price direction
+        - Rising OBV with rising prices = strong uptrend
+        - Divergence between OBV and price can signal reversals
+        
+        Volume Rate of Change:
+        - Measures acceleration in volume
+        - Spike in volume often precedes major price moves
+        """
+        # Volume Moving Average
+        if 'Volume' in data.columns:
+            data['Volume_MA'] = data['Volume'].rolling(self.config.VOLUME_MA_PERIOD).mean()
+            data['Volume_Ratio'] = data['Volume'] / data['Volume_MA']
+            
+            # On-Balance Volume (OBV)
+            price_direction = np.where(data['Close'] > data['Close'].shift(1), 1,
+                                     np.where(data['Close'] < data['Close'].shift(1), -1, 0))
+            volume_flow = price_direction * data['Volume']
+            data['OBV'] = volume_flow.cumsum()
+            
+            # Volume Rate of Change
+            data['Volume_ROC'] = data['Volume'].pct_change(periods=10) * 100
+            
+            # Accumulation/Distribution Line
+            clv = ((data['Close'] - data['Low']) - (data['High'] - data['Close'])) / (data['High'] - data['Low'])
+            clv = clv.fillna(0)  # Handle division by zero
+            data['A_D_Line'] = (clv * data['Volume']).cumsum()
+            
+            # Volume Price Trend (VPT)
+            data['VPT'] = (data['Volume'] * data['Close'].pct_change()).cumsum()
+            
+            # Ease of Movement
+            if len(data) >= 2:
+                distance_moved = (data['High'] + data['Low']) / 2 - (data['High'].shift(1) + data['Low'].shift(1)) / 2
+                box_height = data['Volume'] / (data['High'] - data['Low'])
+                box_height = box_height.replace([np.inf, -np.inf], 0)
+                data['EMV'] = distance_moved / box_height
+                data['EMV_MA'] = data['EMV'].rolling(14).mean()
+        
+        return data
+    
+    def _calculate_advanced_oscillators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate advanced oscillators for sophisticated analysis
+        
+        MACD (Moving Average Convergence Divergence):
+        - Trend-following momentum indicator
+        - MACD Line: 12-day EMA - 26-day EMA
+        - Signal Line: 9-day EMA of MACD line
+        - Histogram: MACD - Signal (momentum of momentum)
+        
+        Commodity Channel Index (CCI):
+        - Measures deviation from statistical mean
+        - >+100: Strong uptrend, <-100: Strong downtrend
+        - Used to identify cyclical turns in commodities and stocks
+        """
+        # MACD
+        if len(data) >= max(self.config.MACD_SLOW, self.config.MACD_SIGNAL):
+            ema_fast = data['Close'].ewm(span=self.config.MACD_FAST).mean()
+            ema_slow = data['Close'].ewm(span=self.config.MACD_SLOW).mean()
+            
+            data['MACD'] = ema_fast - ema_slow
+            data['MACD_Signal'] = data['MACD'].ewm(span=self.config.MACD_SIGNAL).mean()
+            data['MACD_Histogram'] = data['MACD'] - data['MACD_Signal']
+            
+            # MACD crossover signals
+            data['MACD_Bullish_Cross'] = (data['MACD'] > data['MACD_Signal']) & (data['MACD'].shift(1) <= data['MACD_Signal'].shift(1))
+            data['MACD_Bearish_Cross'] = (data['MACD'] < data['MACD_Signal']) & (data['MACD'].shift(1) >= data['MACD_Signal'].shift(1))
+        
+        # Commodity Channel Index (CCI)
+        if len(data) >= 20:
+            typical_price = data['HLC3']
+            sma_tp = typical_price.rolling(20).mean()
+            mean_dev = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())))
+            data['CCI'] = (typical_price - sma_tp) / (0.015 * mean_dev)
+        
+        # Money Flow Index (MFI) - Volume-weighted RSI
+        if len(data) >= 14 and 'Volume' in data.columns:
+            typical_price = data['HLC3']
+            money_flow = typical_price * data['Volume']
+            
+            positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(14).sum()
+            negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(14).sum()
+            
+            money_ratio = positive_flow / negative_flow
+            money_ratio = money_ratio.replace([np.inf, -np.inf], 1)
+            data['MFI'] = 100 - (100 / (1 + money_ratio))
+        
+        # Ultimate Oscillator
+        if len(data) >= 28:
+            bp = data['Close'] - np.minimum(data['Low'], data['Close'].shift(1))
+            tr = np.maximum(data['High'], data['Close'].shift(1)) - np.minimum(data['Low'], data['Close'].shift(1))
+            
+            avg7 = bp.rolling(7).sum() / tr.rolling(7).sum()
+            avg14 = bp.rolling(14).sum() / tr.rolling(14).sum()
+            avg28 = bp.rolling(28).sum() / tr.rolling(28).sum()
+            
+            data['Ultimate_Oscillator'] = 100 * ((4 * avg7) + (2 * avg14) + avg28) / 7
+        
+        return data
+    
+    def _calculate_trend_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Calculate trend-following indicators"""
+        
+        # Average Directional Index (ADX)
+        if len(data) >= 14:
+            plus_dm = data['High'].diff()
+            minus_dm = data['Low'].diff()
+            
+            plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+            minus_dm = (-minus_dm).where((minus_dm > plus_dm.abs()) & (minus_dm < 0), 0)
+            
+            tr = np.maximum(data['High'] - data['Low'],
+                           np.maximum(abs(data['High'] - data['Close'].shift(1)),
+                                    abs(data['Low'] - data['Close'].shift(1))))
+            
+            atr = tr.rolling(14).mean()
+            plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
+            minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
+            
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            data['ADX'] = dx.rolling(14).mean()
+            data['Plus_DI'] = plus_di
+            data['Minus_DI'] = minus_di
+        
+        # Parabolic SAR
+        if len(data) >= 10:
+            data['PSAR'] = self._calculate_parabolic_sar(data)
+        
+        # Ichimoku Cloud components
+        if len(data) >= 52:
+            # Tenkan-sen (Conversion Line): (9-period high + 9-period low) / 2
+            period9_high = data['High'].rolling(9).max()
+            period9_low = data['Low'].rolling(9).min()
+            data['Tenkan_sen'] = (period9_high + period9_low) / 2
+            
+            # Kijun-sen (Base Line): (26-period high + 26-period low) / 2
+            period26_high = data['High'].rolling(26).max()
+            period26_low = data['Low'].rolling(26).min()
+            data['Kijun_sen'] = (period26_high + period26_low) / 2
+            
+            # Senkou Span A: (Tenkan-sen + Kijun-sen) / 2, plotted 26 periods ahead
+            data['Senkou_Span_A'] = ((data['Tenkan_sen'] + data['Kijun_sen']) / 2).shift(26)
+            
+            # Senkou Span B: (52-period high + 52-period low) / 2, plotted 26 periods ahead
+            period52_high = data['High'].rolling(52).max()
+            period52_low = data['Low'].rolling(52).min()
+            data['Senkou_Span_B'] = ((period52_high + period52_low) / 2).shift(26)
+            
+            # Chikou Span: Close plotted 26 periods behind
