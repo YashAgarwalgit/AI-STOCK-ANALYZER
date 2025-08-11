@@ -113,5 +113,3 @@ targets = analyzer.generate_price_targets(data, report)
 This project is designed for quantitative finance practitioners. Contributions welcome for additional indicators, ML models, or analysis features.
 
 **⚠️ Disclaimer**: This tool is for educational and research purposes. Always conduct your own due diligence before making investment decisions.
-
-[1] https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/54763250/1944e0f4-e993-4be9-a0ae-3dd517415321/paste.txt
